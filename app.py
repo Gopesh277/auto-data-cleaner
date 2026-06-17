@@ -1,244 +1,363 @@
+"""
+app.py — Automatic Data Cleaning System  (#auto_data_cleaner)
+================================================================
+Upload a CSV, configure cleaning behaviour from the sidebar, optionally
+derive a new column with if-then rules, then download the cleaned
+dataset plus a full audit report of every step that was performed.
+
+Run with:  streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import copy
+import traceback
+
 import streamlit as st
-import pandas as pd
-import numpy as np
 
-# --------------------------------
-# PAGE CONFIG
-# --------------------------------
-
-st.set_page_config(
-    page_title="Automatic Data Cleaning System",
-    layout="wide"
+from modules.audit_logger import AuditLogger
+from modules.cleaning import (
+    DATE_FORMATS,
+    clean_column_names,
+    convert_date_columns,
+    detect_date_columns,
+    handle_missing_values,
+    remove_duplicates,
+    remove_outliers,
+    standardize_text,
 )
+from modules.data_loader import DataValidationError, load_csv
+from modules.new_column import OPERATOR_LABELS, apply_new_column, validate_rules
 
-# --------------------------------
-# PAGE TITLE
-# --------------------------------
+# ----------------------------------------------------------------------
+# PAGE CONFIG
+# ----------------------------------------------------------------------
+st.set_page_config(page_title="Automatic Data Cleaning System", layout="wide")
 
 st.title("Automatic Data Cleaning System")
-
-st.write("Upload a CSV dataset and clean it automatically.")
-
-# --------------------------------
-# FILE UPLOAD
-# --------------------------------
-
-uploaded_file = st.file_uploader(
-    "Upload CSV File",
-    type=["csv"]
+st.write(
+    "Upload a CSV file, configure cleaning rules in the sidebar, optionally "
+    "add a derived column, then download the cleaned dataset and a full "
+    "audit report."
 )
 
-# --------------------------------
-# PROCESS FILE
-# --------------------------------
+DEFAULT_RULE = {"source": "Column 1", "operator": "=", "compare_value": "", "output_value": ""}
 
-if uploaded_file is not None:
 
-    # --------------------------------
-    # ERROR HANDLING
-    # --------------------------------
+# ----------------------------------------------------------------------
+# SESSION STATE
+# ----------------------------------------------------------------------
+def init_session_state() -> None:
+    defaults = {
+        "applied_new_columns": [],   # confirmed derived columns, persisted across reruns
+        "new_col_rules": [dict(DEFAULT_RULE)],  # rules currently being edited
+        "last_file_id": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-    try:
 
-        # Load dataset
-        df = pd.read_csv(uploaded_file)
+init_session_state()
 
-        # --------------------------------
-        # CHECK EMPTY DATASET
-        # --------------------------------
+# ----------------------------------------------------------------------
+# SIDEBAR HEADER / RESET
+# ----------------------------------------------------------------------
+st.sidebar.title("Cleaning Configuration")
+if st.sidebar.button("Reset App", help="Clear the uploaded file and all settings"):
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
 
-        if df.empty:
-            st.warning("Uploaded CSV file is empty.")
-            st.stop()
+# ----------------------------------------------------------------------
+# FILE UPLOAD
+# ----------------------------------------------------------------------
+uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
-        # --------------------------------
-        # ORIGINAL DATA
-        # --------------------------------
+if uploaded_file is None:
+    st.info("Upload a CSV file to get started.")
+    st.stop()
 
-        st.subheader("Original Dataset")
-        st.dataframe(df)
+# A new file should start with a clean slate for derived columns.
+file_id = f"{uploaded_file.name}-{uploaded_file.size}"
+if st.session_state.last_file_id != file_id:
+    st.session_state.applied_new_columns = []
+    st.session_state.new_col_rules = [dict(DEFAULT_RULE)]
+    st.session_state.last_file_id = file_id
 
-        # --------------------------------
-        # DATASET INFO
-        # --------------------------------
+audit = AuditLogger()
 
-        st.subheader("Dataset Information")
+# ----------------------------------------------------------------------
+# LOAD & VALIDATE
+# ----------------------------------------------------------------------
+try:
+    df = load_csv(uploaded_file)
+except DataValidationError as exc:
+    st.error(str(exc))
+    st.stop()
+except Exception as exc:  # noqa: BLE001 - surfaced to the user deliberately
+    st.error(f"Unexpected error while reading the file: {exc}")
+    with st.expander("Show technical details"):
+        st.code(traceback.format_exc())
+    st.stop()
 
-        col1, col2 = st.columns(2)
+original_shape = df.shape
 
-        col1.metric("Rows", df.shape[0])
-        col2.metric("Columns", df.shape[1])
+st.subheader("Original Dataset")
+st.dataframe(df, use_container_width=True)
 
-        st.write("### Column Names")
-        st.write(df.columns.tolist())
+info_col1, info_col2 = st.columns(2)
+info_col1.metric("Rows", df.shape[0])
+info_col2.metric("Columns", df.shape[1])
 
-        # --------------------------------
-        # MISSING VALUES
-        # --------------------------------
+st.write("**Column names:**", df.columns.tolist())
 
-        st.subheader("Missing Values")
+st.subheader("Missing Values (Before Cleaning)")
+st.dataframe(df.isnull().sum().rename("Missing Count"), use_container_width=True)
 
-        missing_values = df.isnull().sum()
+# ----------------------------------------------------------------------
+# SIDEBAR — CLEANING CONFIGURATION (format-by-user controls)
+# ----------------------------------------------------------------------
+with st.sidebar.expander("Text Formatting", expanded=True):
+    case_option = st.selectbox(
+        "Text case for all text columns",
+        ["UPPERCASE", "lowercase", "Title Case", "No change"],
+        index=0,
+    )
 
-        st.dataframe(missing_values)
+with st.sidebar.expander("Missing Values", expanded=True):
+    numeric_strategy = st.selectbox(
+        "Numeric columns",
+        ["Median", "Mean", "Mode", "Custom Value", "Leave as is"],
+        index=0,
+    )
+    numeric_custom_value = 0.0
+    if numeric_strategy == "Custom Value":
+        numeric_custom_value = st.number_input("Custom numeric fill value", value=0.0)
 
-        # --------------------------------
-        # CLEANING PROCESS
-        # --------------------------------
+    text_strategy = st.selectbox(
+        "Text columns",
+        ['"Unknown" placeholder', "Mode", "Custom Text", "Leave as is"],
+        index=0,
+    )
+    text_custom_value = "Unknown"
+    if text_strategy == "Custom Text":
+        text_custom_value = st.text_input("Custom text fill value", value="Unknown")
 
-        cleaned_df = df.copy()
-
-        # -----------------------------
-        # 1. Remove Duplicates
-        # -----------------------------
-
-        duplicates = cleaned_df.duplicated().sum()
-
-        cleaned_df = cleaned_df.drop_duplicates()
-
-        # -----------------------------
-        # 2. Clean Column Names
-        # -----------------------------
-
-        cleaned_df.columns = (
-            cleaned_df.columns
-            .str.strip()
-            .str.lower()
+with st.sidebar.expander("Outlier Removal", expanded=True):
+    outlier_enabled = st.checkbox("Remove outliers (IQR method)", value=True)
+    iqr_multiplier = 1.5
+    if outlier_enabled:
+        iqr_multiplier = st.slider(
+            "Sensitivity (IQR multiplier)",
+            0.5, 3.0, 1.5, 0.1,
+            help="Lower = stricter (removes more rows). Higher = more lenient.",
         )
 
-        # -----------------------------
-        # 3. Handle Missing Values
-        # -----------------------------
+# Detect date-like columns on a lightly-cleaned probe copy so the sidebar
+# can offer real column names (after stripping/lowercasing) before the
+# full pipeline has run.
+_probe_df = df.copy()
+_probe_df.columns = _probe_df.columns.str.strip().str.lower()
+candidate_date_cols = detect_date_columns(_probe_df)
 
-        for column in cleaned_df.columns:
+with st.sidebar.expander("Date Conversion", expanded=bool(candidate_date_cols)):
+    if candidate_date_cols:
+        date_cols_to_convert = st.multiselect(
+            "Columns to convert", candidate_date_cols, default=candidate_date_cols
+        )
+        date_output_format = st.selectbox("Output format", list(DATE_FORMATS.keys()), index=0)
+    else:
+        st.caption("No date-like columns were detected.")
+        date_cols_to_convert = []
+        date_output_format = next(iter(DATE_FORMATS))
 
-            # Numeric columns
-            if pd.api.types.is_numeric_dtype(
-                cleaned_df[column]
-            ):
+# ----------------------------------------------------------------------
+# CLEANING PIPELINE
+# ----------------------------------------------------------------------
+try:
+    cleaned_df = df.copy()
 
-                cleaned_df[column] = cleaned_df[column].fillna(
-                    cleaned_df[column].median()
-                )
+    cleaned_df, duplicates_removed = remove_duplicates(cleaned_df, audit)
+    cleaned_df = clean_column_names(cleaned_df, audit)
 
-            # Text columns
-            else:
+    date_converted_cols: list[str] = []
+    if date_cols_to_convert:
+        cleaned_df, date_converted_cols = convert_date_columns(
+            cleaned_df, date_cols_to_convert, date_output_format, audit
+        )
 
-                cleaned_df[column] = cleaned_df[column].fillna(
-                    "Unknown"
-                )
+    cleaned_df = handle_missing_values(
+        cleaned_df,
+        audit,
+        numeric_strategy,
+        numeric_custom_value,
+        text_strategy,
+        text_custom_value,
+    )
 
-        # -----------------------------
-        # 4. Standardize Text Columns
-        # -----------------------------
+    cleaned_df = standardize_text(cleaned_df, audit, case_option, exclude_columns=date_converted_cols)
 
-        text_cols = cleaned_df.select_dtypes(
-            include='object'
-        ).columns
+    cleaned_df = remove_outliers(cleaned_df, audit, outlier_enabled, iqr_multiplier)
 
-        for col in text_cols:
-
-            cleaned_df[col] = (
-                cleaned_df[col]
-                .astype(str)
-                .str.strip()
-                .str.upper()
+    # Re-apply any derived columns confirmed in a previous interaction.
+    for spec in st.session_state.applied_new_columns:
+        if spec["col1"] in cleaned_df.columns and spec["col2"] in cleaned_df.columns:
+            cleaned_df = apply_new_column(
+                cleaned_df,
+                spec["col1"],
+                spec["col2"],
+                spec["name"],
+                spec["rules"],
+                spec["else_value"],
+                audit,
             )
 
-        # -----------------------------
-        # 5. Remove Outliers (IQR)
-        # -----------------------------
+except Exception as exc:  # noqa: BLE001 - surfaced to the user deliberately
+    st.error(f"An error occurred while cleaning the data: {exc}")
+    with st.expander("Show technical details"):
+        st.code(traceback.format_exc())
+    st.stop()
 
-        numeric_cols = cleaned_df.select_dtypes(
-            include=np.number
-        ).columns
+# ----------------------------------------------------------------------
+# NEW COLUMN BUILDER (conditional / if-then logic on two columns)
+# ----------------------------------------------------------------------
+st.subheader("➕ Add a Derived Column (If-Then Rules)")
+st.caption(
+    "Pick two columns and write if-then rules to build a new column. Rules "
+    "run top to bottom — the first match wins. Use **{COL1}** / **{COL2}** "
+    "inside an output value to insert that row's actual value."
+)
 
-        for col in numeric_cols:
+if cleaned_df.shape[1] < 2:
+    st.info("Need at least two columns in the cleaned dataset to use this feature.")
+else:
+    column_options = list(cleaned_df.columns)
+    pick_col1, pick_col2, pick_name = st.columns(3)
+    with pick_col1:
+        source_col1 = st.selectbox("Column 1", column_options, key="nc_col1_select")
+    with pick_col2:
+        remaining_cols = [c for c in column_options if c != source_col1]
+        source_col2 = st.selectbox("Column 2", remaining_cols, key="nc_col2_select")
+    with pick_name:
+        new_col_name = st.text_input("New column name", value="derived_column", key="nc_name_input")
 
-            Q1 = cleaned_df[col].quantile(0.25)
-            Q3 = cleaned_df[col].quantile(0.75)
+    delete_idx = None
+    for idx, rule in enumerate(st.session_state.new_col_rules):
+        rc1, rc2, rc3, rc4, rc5 = st.columns([1.3, 1, 1.3, 1.6, 0.5])
+        with rc1:
+            rule["source"] = st.selectbox(
+                "If column",
+                ["Column 1", "Column 2"],
+                index=["Column 1", "Column 2"].index(rule["source"]),
+                key=f"nc_source_{idx}",
+            )
+        with rc2:
+            rule["operator"] = st.selectbox(
+                "Operator",
+                OPERATOR_LABELS,
+                index=OPERATOR_LABELS.index(rule["operator"]),
+                key=f"nc_op_{idx}",
+            )
+        with rc3:
+            if rule["operator"] not in ("is null", "is not null"):
+                rule["compare_value"] = st.text_input(
+                    "Compare to", value=rule["compare_value"], key=f"nc_val_{idx}"
+                )
+            else:
+                rule["compare_value"] = ""
+                st.write("—")
+        with rc4:
+            rule["output_value"] = st.text_input(
+                "Then output", value=rule["output_value"], key=f"nc_out_{idx}"
+            )
+        with rc5:
+            st.write("")
+            if st.button("Delete", key=f"nc_remove_{idx}", help="Remove this rule"):
+                delete_idx = idx
 
-            IQR = Q3 - Q1
+    if delete_idx is not None:
+        st.session_state.new_col_rules.pop(delete_idx)
+        st.rerun()
 
-            lower = Q1 - 1.5 * IQR
-            upper = Q3 + 1.5 * IQR
+    add_rule_col, _ = st.columns([1, 4])
+    with add_rule_col:
+        if st.button("+ Add rule"):
+            st.session_state.new_col_rules.append(dict(DEFAULT_RULE))
+            st.rerun()
 
-            cleaned_df = cleaned_df[
-                (cleaned_df[col] >= lower) &
-                (cleaned_df[col] <= upper)
-            ]
+    else_value = st.text_input("Else (default) value", value="Unknown", key="nc_else_input")
 
-        # --------------------------------
-        # CLEANED DATA
-        # --------------------------------
+    if st.button("Apply New Column", type="primary"):
+        is_valid, message = validate_rules(st.session_state.new_col_rules, else_value)
+        if new_col_name.strip() == "":
+            st.error("Please give the new column a name.")
+        elif new_col_name in cleaned_df.columns:
+            st.error(f"Column '{new_col_name}' already exists. Choose a different name.")
+        elif not is_valid:
+            st.error(message)
+        else:
+            st.session_state.applied_new_columns.append(
+                {
+                    "col1": source_col1,
+                    "col2": source_col2,
+                    "name": new_col_name,
+                    "rules": copy.deepcopy(st.session_state.new_col_rules),
+                    "else_value": else_value,
+                }
+            )
+            st.session_state.new_col_rules = [dict(DEFAULT_RULE)]
+            st.rerun()
 
-        st.subheader("Cleaned Dataset")
-
-        st.dataframe(cleaned_df)
-
-        # --------------------------------
-        # CLEANING REPORT
-        # --------------------------------
-
-        st.subheader("Cleaning Report")
-
-        st.success(
-            f"Removed Duplicates: {duplicates}"
+if st.session_state.applied_new_columns:
+    st.write("**Derived columns added:**")
+    for i, spec in enumerate(st.session_state.applied_new_columns):
+        row_left, row_right = st.columns([5, 1])
+        row_left.write(
+            f"`{spec['name']}` ← if-then on `{spec['col1']}` / `{spec['col2']}` "
+            f"({len(spec['rules'])} rule(s))"
         )
+        if row_right.button("Remove", key=f"applied_remove_{i}"):
+            st.session_state.applied_new_columns.pop(i)
+            st.rerun()
 
-        st.success(
-            f"Final Rows After Cleaning: {cleaned_df.shape[0]}"
-        )
+# ----------------------------------------------------------------------
+# RESULTS
+# ----------------------------------------------------------------------
+st.subheader("Cleaned Dataset")
+st.dataframe(cleaned_df, use_container_width=True)
 
-        # --------------------------------
-        # DATA STATISTICS
-        # --------------------------------
+st.subheader("Cleaning Report")
+report_col1, report_col2 = st.columns(2)
+report_col1.success(f"Duplicate rows removed: {duplicates_removed}")
+report_col2.success(f"Final shape: {cleaned_df.shape[0]} rows × {cleaned_df.shape[1]} columns")
 
-        st.subheader("Dataset Statistics")
+st.subheader("Dataset Statistics")
+st.dataframe(cleaned_df.describe(include="all"), use_container_width=True)
 
-        st.dataframe(cleaned_df.describe())
+# ----------------------------------------------------------------------
+# DOWNLOADS
+# ----------------------------------------------------------------------
+st.subheader("Downloads")
+download_col1, download_col2 = st.columns(2)
 
-        # --------------------------------
-        # DOWNLOAD CLEANED DATA
-        # --------------------------------
+csv_bytes = cleaned_df.to_csv(index=False).encode("utf-8")
+download_col1.download_button(
+    label="Download Cleaned Dataset (CSV)",
+    data=csv_bytes,
+    file_name="cleaned_dataset.csv",
+    mime="text/csv",
+)
 
-        csv = cleaned_df.to_csv(
-            index=False
-        ).encode('utf-8')
+audit_report = audit.to_markdown(original_shape, cleaned_df.shape, filename=uploaded_file.name)
+download_col2.download_button(
+    label="Download Cleaning Audit Report (.md)",
+    data=audit_report.encode("utf-8"),
+    file_name="cleaning_audit_report.md",
+    mime="text/markdown",
+)
 
-        st.download_button(
-            label="Download Cleaned Dataset",
-            data=csv,
-            file_name="cleaned_dataset.csv",
-            mime="text/csv"
-        )
+with st.expander("View Cleaning Audit Log"):
+    st.markdown(audit_report)
 
-    # --------------------------------
-    # ERROR MESSAGES
-    # --------------------------------
-
-    except pd.errors.EmptyDataError:
-
-        st.error(
-            "The uploaded CSV file is empty."
-        )
-
-    except pd.errors.ParserError:
-
-        st.error(
-            "Error parsing CSV file. "
-            "Please upload a valid CSV."
-        )
-
-    except UnicodeDecodeError:
-
-        st.error(
-            "Encoding error. "
-            "Try saving the CSV as UTF-8."
-        )
-
-    except Exception as e:
-
-        st.error(
-            f"Unexpected Error: {e}"
-        )
+# auto_data_cleaner
